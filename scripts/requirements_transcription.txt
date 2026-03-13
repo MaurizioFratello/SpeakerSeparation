@@ -1,0 +1,16 @@
+# Requirements for speaker-attributed transcription
+# Install with: pip install -r requirements_transcription.txt
+
+# pyannote-audio for speaker diarization
+pyannote.audio>=3.1.0
+
+# Whisper for transcription
+openai-whisper>=20231117
+
+# Audio processing (usually comes with PyTorch)
+torch>=2.0.0
+torchaudio>=2.0.0
+
+# HuggingFace Hub for model access
+huggingface-hub>=0.20.0
+
