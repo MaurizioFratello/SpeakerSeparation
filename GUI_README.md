@@ -31,6 +31,8 @@ python gui_main.py
   - Manuell: Vordefinierte Anzahl von Sprechern
 - **Live-Transkript:** Segmente erscheinen in Echtzeit während der Verarbeitung
 - **Auto-Save:** Transkript wird automatisch als `{dateiname}_transcript.txt` gespeichert
+- **YouTube-URL Input:** YouTube-Link einfügen, Audio via yt-dlp laden und verarbeiten
+- **Markdown Export:** YouTube-Transkripte werden als `exports/{video_id}_transcript.md` gespeichert
 - **Cancel-Funktion:** Verarbeitung kann jederzeit abgebrochen werden
 - **Fortschrittsanzeige:** Visueller Fortschrittsbalken und Status-Updates
 
@@ -41,6 +43,7 @@ python gui_main.py
   - macOS: `brew install ffmpeg`
   - Linux: `sudo apt-get install ffmpeg`
   - Windows: Download von https://ffmpeg.org/download.html
+- **yt-dlp:** Für YouTube-Downloads (`pip install yt-dlp`)
 
 ## Dateistruktur
 
@@ -51,7 +54,9 @@ SpeakerSeparation/
 │   ├── __init__.py
 │   ├── main_window.py       # Hauptfenster
 │   ├── transcription_worker.py  # Background-Worker
-│   └── audio_converter.py   # Audio-Konvertierung
+│   ├── audio_converter.py   # Audio-Konvertierung
+│   ├── youtube_download.py  # YouTube Audio-Download
+│   └── markdown_export.py   # Markdown-Export
 └── requirements_gui.txt     # GUI-Dependencies
 ```
 

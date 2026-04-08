@@ -459,10 +459,11 @@ def transcribe_audio(
         model_name="nvidia/parakeet-tdt-0.6b-v3"
     )
     
-    # Move to device if MPS available
+    # Move ASR model to the best available accelerator.
+    # Previously only MPS was handled, which left CUDA runs on CPU.
     device_name = get_device()
-    if device_name == "mps":
-        asr_model = asr_model.to(torch.device("mps"))
+    if device_name in ("mps", "cuda"):
+        asr_model = asr_model.to(torch.device(device_name))
     
     # Chunking parameters for MPS compatibility (large tensors cause conv2d issues)
     CHUNK_DURATION = 240.0  # 4 minutes per chunk
@@ -564,6 +565,44 @@ def transcribe_audio(
     return all_segments
 
 
+def merge_consecutive_same_speaker(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Merge contiguous segments when the speaker does not change.
+    """
+    if not segments:
+        return []
+
+    merged: List[Dict[str, Any]] = []
+    current = {
+        "start": float(segments[0].get("start", 0.0)),
+        "end": float(segments[0].get("end", 0.0)),
+        "speaker": str(segments[0].get("speaker", "UNKNOWN")),
+        "text": str(segments[0].get("text", "")).strip(),
+    }
+
+    for seg in segments[1:]:
+        speaker = str(seg.get("speaker", "UNKNOWN"))
+        start = float(seg.get("start", 0.0))
+        end = float(seg.get("end", 0.0))
+        text = str(seg.get("text", "")).strip()
+
+        if speaker == current["speaker"]:
+            current["end"] = end
+            if text:
+                current["text"] = f"{current['text']} {text}".strip()
+        else:
+            merged.append(current)
+            current = {
+                "start": start,
+                "end": end,
+                "speaker": speaker,
+                "text": text,
+            }
+
+    merged.append(current)
+    return merged
+
+
 def main():
     """
     CLI entry point for speaker-attributed transcription.
@@ -604,13 +643,14 @@ def main():
             progress_callback=progress_callback,
             segment_callback=segment_callback
         )
+        merged_segments = merge_consecutive_same_speaker(segments)
         
         print("\n" + "="*60)
-        print(f"✓ Complete! ({len(segments)} segments total)")
+        print(f"✓ Complete! ({len(segments)} segments total -> {len(merged_segments)} merged blocks)")
         print("="*60)
         
         # Auto-save transcript to file (same as GUI behavior)
-        if segments:
+        if merged_segments:
             try:
                 from pathlib import Path
                 source_path = Path(audio_file)
@@ -618,7 +658,7 @@ def main():
                 
                 # Format transcript
                 lines = []
-                for seg in segments:
+                for seg in merged_segments:
                     start = seg['start']
                     end = seg['end']
                     speaker = seg['speaker']

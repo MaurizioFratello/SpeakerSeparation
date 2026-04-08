@@ -17,7 +17,7 @@ from pathlib import Path
 
 
 # Supported input formats
-SUPPORTED_FORMATS = {'.mp3', '.m4a', '.wav', '.aiff', '.aif', '.flac', '.ogg', '.wma'}
+SUPPORTED_FORMATS = {'.mp3', '.m4a', '.wav', '.aiff', '.aif', '.flac', '.ogg', '.wma', '.webm'}
 
 
 def is_supported_format(file_path: str) -> bool:

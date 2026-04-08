@@ -1,2 +1,4 @@
 pyside6>=6.5.0
+yt-dlp
+python-dotenv
 

@@ -11,22 +11,24 @@ via worker thread. Supports streaming transcript updates and cancellation.
 import os
 import time
 import logging
+import shutil
 from pathlib import Path
 from typing import Optional
 
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QRadioButton, QSpinBox, QTextEdit, QLabel, QFileDialog,
-    QMessageBox, QProgressBar, QStatusBar, QGroupBox, QButtonGroup
+    QMessageBox, QProgressBar, QStatusBar, QGroupBox, QButtonGroup, QLineEdit
 )
 from PySide6.QtCore import Qt, QSize, Signal, QTimer
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QFont
 
 from gui.transcription_worker import TranscriptionWorker
 from gui.audio_converter import is_supported_format
+from gui.markdown_export import segments_to_markdown, merge_consecutive_same_speaker
+from gui.youtube_download import download_youtube_audio, is_youtube_url
 
 # Import for pipeline loading
-import os
 from dotenv import load_dotenv
 load_dotenv()
 from pyannote.audio import Pipeline
@@ -75,7 +77,7 @@ class DragDropWidget(QLabel):
                 background-color: #EBF5FF;
             }
         """)
-        self.setText("Drop audio file here or click to select\n\nSupported formats: MP3, M4A, WAV, AIFF, FLAC")
+        self.setText("Drop audio file here or click to select\n\nSupported formats: MP3, M4A, WAV, AIFF, FLAC, WEBM")
         self._original_style = self.styleSheet()
     
     def dragEnterEvent(self, event: QDragEnterEvent):
@@ -125,7 +127,7 @@ class DragDropWidget(QLabel):
             self,
             "Audio-Datei auswählen",
             "",
-            "Audio Files (*.mp3 *.m4a *.wav *.aiff *.aif *.flac *.ogg *.wma);;All Files (*)"
+            "Audio Files (*.mp3 *.m4a *.wav *.aiff *.aif *.flac *.ogg *.wma *.webm);;All Files (*)"
         )
         if file_path:
             self.fileDropped.emit(file_path)
@@ -153,6 +155,11 @@ class MainWindow(QMainWindow):
         self._worker: Optional[TranscriptionWorker] = None
         self._is_processing = False
         self._transcript_segments: list = []
+        self._source_mode = "file"
+        self._youtube_url: Optional[str] = None
+        self._youtube_title: Optional[str] = None
+        self._youtube_video_id: Optional[str] = None
+        self._download_temp_dir: Optional[str] = None
         self._pipeline = None  # Pre-loaded pipeline (loaded in main thread to avoid threading issues)
         self._pipeline_loading = False  # Track if pipeline is currently loading
         
@@ -238,6 +245,21 @@ class MainWindow(QMainWindow):
         self.drag_drop = DragDropWidget()
         self.drag_drop.fileDropped.connect(self._on_file_selected)
         layout.addWidget(self.drag_drop)
+
+        # Optional YouTube URL input
+        youtube_group = QGroupBox("YouTube Source (optional)")
+        youtube_layout = QVBoxLayout()
+        youtube_layout.setSpacing(8)
+        youtube_hint = QLabel("Paste a YouTube URL to download audio and export transcript as markdown.")
+        youtube_hint.setStyleSheet("font-size: 12px; color: #6E6E73; font-weight: 400;")
+        self.youtube_url_input = QLineEdit()
+        self.youtube_url_input.setPlaceholderText("https://www.youtube.com/watch?v=...")
+        self.youtube_url_input.setMinimumHeight(36)
+        self.youtube_url_input.textChanged.connect(self._on_url_changed)
+        youtube_layout.addWidget(youtube_hint)
+        youtube_layout.addWidget(self.youtube_url_input)
+        youtube_group.setLayout(youtube_layout)
+        layout.addWidget(youtube_group)
         
         # Settings group
         settings_group = QGroupBox("Speaker Configuration")
@@ -386,6 +408,27 @@ class MainWindow(QMainWindow):
         """
         # Defer loading slightly to let GUI render
         QTimer.singleShot(100, self._load_pipeline)
+
+    def _detect_device_name(self) -> str:
+        """Detect preferred inference device."""
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+
+    def _device_status_message(self) -> str:
+        """Build a human-readable startup status message for the status bar."""
+        device_name = self._detect_device_name()
+        if device_name == "cuda":
+            try:
+                gpu_name = torch.cuda.get_device_name(0)
+                return f"Ready - Using CUDA: {gpu_name}"
+            except Exception:
+                return "Ready - Using CUDA"
+        if device_name == "mps":
+            return "Ready - Using MPS (Apple GPU)"
+        return "Ready - Using CPU"
     
     def _load_pipeline(self):
         """Load pipeline in main thread."""
@@ -416,14 +459,12 @@ class MainWindow(QMainWindow):
             logger.debug(f"Pipeline.from_pretrained() completed in {load_elapsed:.2f}s")
 
             # Move to device
-            device_name = "mps" if (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()) else "cpu"
-            if torch.cuda.is_available():
-                device_name = "cuda"
+            device_name = self._detect_device_name()
             device = torch.device(device_name)
             self._pipeline.to(device)
 
             logger.debug(f"Pipeline loaded and moved to {device_name}")
-            self.status_bar.showMessage("Ready")
+            self.status_bar.showMessage(self._device_status_message())
             self._pipeline_loading = False
 
         except Exception as e:
@@ -444,15 +485,46 @@ class MainWindow(QMainWindow):
                 self,
                 "Nicht unterstütztes Format",
                 f"Das Format '{ext}' wird nicht unterstützt.\n\n"
-                f"Unterstützte Formate: MP3, M4A, WAV, AIFF, FLAC, OGG, WMA"
+                f"Unterstützte Formate: MP3, M4A, WAV, AIFF, FLAC, OGG, WMA, WEBM"
             )
             return
-        
+
+        self._cleanup_youtube_temp()
+        self._source_mode = "file"
+        self._youtube_url = None
+        self._youtube_title = None
+        self._youtube_video_id = None
+        self.youtube_url_input.blockSignals(True)
+        self.youtube_url_input.clear()
+        self.youtube_url_input.blockSignals(False)
+
         self._current_audio_file = file_path
         filename = os.path.basename(file_path)
         self.drag_drop.setText(f"{filename}\n\nClick to change selection")
         self.start_button.setEnabled(True)
         self.status_bar.showMessage(f"File loaded: {filename}")
+
+    def _on_url_changed(self, text: str):
+        """Handle YouTube URL updates from input."""
+        url = text.strip()
+        if url:
+            self._source_mode = "youtube"
+            self._current_audio_file = None
+            self.start_button.setEnabled(True)
+            self.drag_drop.setText("URL mode active\n\nYou can switch back by selecting a local file")
+            self.status_bar.showMessage("YouTube URL ready")
+            return
+
+        if self._source_mode == "youtube":
+            self._source_mode = "file"
+        self._youtube_url = None
+        if self._current_audio_file:
+            filename = os.path.basename(self._current_audio_file)
+            self.drag_drop.setText(f"{filename}\n\nClick to change selection")
+            self.start_button.setEnabled(True)
+        else:
+            self.drag_drop.setText("Drop audio file here or click to select\n\nSupported formats: MP3, M4A, WAV, AIFF, FLAC, WEBM")
+            self.start_button.setEnabled(False)
     
     def _on_open_clicked(self):
         """Open file dialog for audio file selection."""
@@ -460,19 +532,43 @@ class MainWindow(QMainWindow):
             self,
             "Audio-Datei auswählen",
             "",
-            "Audio Files (*.mp3 *.m4a *.wav *.aiff *.aif *.flac *.ogg *.wma);;All Files (*)"
+            "Audio Files (*.mp3 *.m4a *.wav *.aiff *.aif *.flac *.ogg *.wma *.webm);;All Files (*)"
         )
         if file_path:
             self._on_file_selected(file_path)
     
     def _on_start_clicked(self):
         """Start transcription process."""
-        if not self._current_audio_file:
-            QMessageBox.warning(self, "Fehler", "Bitte wählen Sie zuerst eine Audio-Datei aus.")
-            return
-        
         if self._is_processing:
             return
+
+        url_text = self.youtube_url_input.text().strip()
+        if url_text:
+            if not is_youtube_url(url_text):
+                QMessageBox.warning(self, "Invalid URL", "Please enter a valid YouTube URL.")
+                return
+            try:
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+                self.status_bar.showMessage("Downloading YouTube audio...")
+                yt_result = download_youtube_audio(url_text)
+                self._cleanup_youtube_temp()
+                self._source_mode = "youtube"
+                self._youtube_url = yt_result["source_url"]
+                self._youtube_title = yt_result["title"]
+                self._youtube_video_id = yt_result["video_id"]
+                self._download_temp_dir = yt_result["temp_dir"]
+                self._current_audio_file = yt_result["audio_path"]
+                self.drag_drop.setText(f"{self._youtube_title}\n\nDownloaded from YouTube")
+            except Exception as e:
+                QMessageBox.critical(self, "YouTube download failed", str(e))
+                return
+            finally:
+                QApplication.restoreOverrideCursor()
+        elif not self._current_audio_file:
+            QMessageBox.warning(self, "Fehler", "Bitte wählen Sie zuerst eine Audio-Datei aus.")
+            return
+        else:
+            self._source_mode = "file"
         
         # Get speaker count
         num_speakers = None
@@ -492,6 +588,7 @@ class MainWindow(QMainWindow):
         self.speaker_manual.setEnabled(False)
         self.speaker_count.setEnabled(False)
         self.open_button.setEnabled(False)
+        self.youtube_url_input.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         
@@ -512,6 +609,7 @@ class MainWindow(QMainWindow):
                 if self.speaker_manual.isChecked():
                     self.speaker_count.setEnabled(True)
                 self.open_button.setEnabled(True)
+                self.youtube_url_input.setEnabled(True)
                 self.progress_bar.setVisible(False)
                 return
             else:
@@ -528,9 +626,7 @@ class MainWindow(QMainWindow):
                         token=token
                     )
                     
-                    device_name = "mps" if (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()) else "cpu"
-                    if torch.cuda.is_available():
-                        device_name = "cuda"
+                    device_name = self._detect_device_name()
                     device = torch.device(device_name)
                     self._pipeline.to(device)
                     logger.debug(f"Pipeline loaded and moved to {device_name}")
@@ -546,6 +642,7 @@ class MainWindow(QMainWindow):
                     if self.speaker_manual.isChecked():
                         self.speaker_count.setEnabled(True)
                     self.open_button.setEnabled(True)
+                    self.youtube_url_input.setEnabled(True)
                     self.progress_bar.setVisible(False)
                     return
         
@@ -620,12 +717,16 @@ class MainWindow(QMainWindow):
         if self.speaker_manual.isChecked():
             self.speaker_count.setEnabled(True)
         self.open_button.setEnabled(True)
+        self.youtube_url_input.setEnabled(True)
         self.progress_bar.setVisible(False)
         
         if segments:
-            self.status_bar.showMessage(f"Transcription completed ({len(segments)} segments)")
+            merged_segments = merge_consecutive_same_speaker(segments)
+            self.status_bar.showMessage(
+                f"Transcription completed ({len(segments)} segments -> {len(merged_segments)} blocks)"
+            )
             # Auto-save transcript
-            self._auto_save_transcript(segments)
+            self._auto_save_transcript(merged_segments)
         else:
             self.status_bar.showMessage("Transcription cancelled")
         
@@ -634,6 +735,7 @@ class MainWindow(QMainWindow):
             self._worker.quit()
             self._worker.wait()
             self._worker = None
+        self._cleanup_youtube_temp()
     
     def _on_error(self, error_message: str):
         """Handle errors from worker."""
@@ -646,6 +748,7 @@ class MainWindow(QMainWindow):
         if self.speaker_manual.isChecked():
             self.speaker_count.setEnabled(True)
         self.open_button.setEnabled(True)
+        self.youtube_url_input.setEnabled(True)
         self.progress_bar.setVisible(False)
         
         QMessageBox.critical(self, "Error", error_message)
@@ -656,6 +759,7 @@ class MainWindow(QMainWindow):
             self._worker.quit()
             self._worker.wait()
             self._worker = None
+        self._cleanup_youtube_temp()
     
     def _auto_save_transcript(self, segments: list):
         """
@@ -670,22 +774,34 @@ class MainWindow(QMainWindow):
             return
         
         try:
-            # Determine output path
+            # Defensive merge so save/export paths always use grouped speaker turns.
+            segments = merge_consecutive_same_speaker(segments)
             source_path = Path(self._current_audio_file)
-            output_path = source_path.parent / f"{source_path.stem}_transcript.txt"
-            
-            # Format transcript
-            lines = []
-            for seg in segments:
-                start = seg['start']
-                end = seg['end']
-                speaker = seg['speaker']
-                text = seg['text']
-                lines.append(f"[{start:6.1f}s - {end:6.1f}s] {speaker}: {text}")
-            
-            # Write file
-            with open(output_path, 'w', encoding='utf-8') as f:
-                f.write('\n'.join(lines))
+            if self._source_mode == "youtube":
+                exports_dir = Path(__file__).resolve().parent.parent / "exports"
+                exports_dir.mkdir(parents=True, exist_ok=True)
+                stem = self._safe_filename(self._youtube_video_id or self._youtube_title or source_path.stem)
+                output_path = exports_dir / f"{stem}_transcript.md"
+                markdown = segments_to_markdown(
+                    segments,
+                    title=self._youtube_title or source_path.stem,
+                    source_url=self._youtube_url,
+                )
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write(markdown)
+            else:
+                output_path = source_path.parent / f"{source_path.stem}_transcript.txt"
+
+                lines = []
+                for seg in segments:
+                    start = seg['start']
+                    end = seg['end']
+                    speaker = seg['speaker']
+                    text = seg['text']
+                    lines.append(f"[{start:6.1f}s - {end:6.1f}s] {speaker}: {text}")
+
+                with open(output_path, 'w', encoding='utf-8') as f:
+                    f.write('\n'.join(lines))
             
             self.status_bar.showMessage(
                 f"Transcript saved: {output_path.name}",
@@ -698,6 +814,19 @@ class MainWindow(QMainWindow):
                 "Save Failed",
                 f"Could not save transcript:\n{str(e)}"
             )
+
+    @staticmethod
+    def _safe_filename(value: str) -> str:
+        cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in value)
+        return cleaned.strip("_")[:100] or "transcript"
+
+    def _cleanup_youtube_temp(self):
+        if self._source_mode != "youtube":
+            return
+        if self._download_temp_dir and os.path.isdir(self._download_temp_dir):
+            shutil.rmtree(self._download_temp_dir, ignore_errors=True)
+        self._download_temp_dir = None
+        self._current_audio_file = None
     
     def closeEvent(self, event):
         """Handle window close - cancel worker if running."""
