@@ -17,7 +17,7 @@ from typing import Optional
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QRadioButton, QSpinBox, QTextEdit, QLabel, QFileDialog,
+    QRadioButton, QSpinBox, QTextEdit, QLabel, QFileDialog, QComboBox, QCheckBox,
     QMessageBox, QProgressBar, QStatusBar, QGroupBox, QButtonGroup, QLineEdit
 )
 from PySide6.QtCore import Qt, QSize, Signal, QTimer
@@ -143,6 +143,17 @@ class MainWindow(QMainWindow):
     CONTEXT: PySide6 main window pattern. Coordinates between UI components
     and background worker thread via signals/slots.
     """
+    LANGUAGE_OPTIONS = [
+        ("Automatisch", "auto"),
+        ("Deutsch", "de"),
+        ("Englisch", "en"),
+    ]
+
+    def _selected_backend_label(self, language_code: str, strict_mode: bool) -> str:
+        """Return human-readable backend label for current language settings."""
+        if strict_mode and language_code in {"de", "en"}:
+            return f"Whisper ({language_code})"
+        return "Parakeet"
     
     def __init__(self):
         super().__init__()
@@ -287,6 +298,33 @@ class MainWindow(QMainWindow):
         speaker_layout.addWidget(self.speaker_count)
         speaker_layout.addStretch()
         settings_layout.addLayout(speaker_layout)
+
+        # Language selection for ASR
+        language_layout = QHBoxLayout()
+        language_layout.setSpacing(12)
+        language_label = QLabel("Transkriptionssprache:")
+        self.language_combo = QComboBox()
+        for label, code in self.LANGUAGE_OPTIONS:
+            self.language_combo.addItem(label, code)
+        self.language_combo.setCurrentIndex(0)  # Automatisch
+        self.language_combo.setMinimumWidth(180)
+        language_layout.addWidget(language_label)
+        language_layout.addWidget(self.language_combo)
+        language_layout.addStretch()
+        settings_layout.addLayout(language_layout)
+
+        # Strict language mode: force Whisper for selected manual language
+        strict_layout = QHBoxLayout()
+        strict_layout.setSpacing(12)
+        self.strict_language_mode = QCheckBox("Strikte Sprache erzwingen (Whisper)")
+        self.strict_language_mode.setChecked(True)
+        self.strict_language_mode.setToolTip(
+            "Aktiv: Deutsch/Englisch wird mit Whisper sprachlich erzwungen.\n"
+            "Inaktiv: Parakeet wird verwendet (kann Sprachen mischen)."
+        )
+        strict_layout.addWidget(self.strict_language_mode)
+        strict_layout.addStretch()
+        settings_layout.addLayout(strict_layout)
         
         settings_group.setLayout(settings_layout)
         layout.addWidget(settings_group)
@@ -575,6 +613,11 @@ class MainWindow(QMainWindow):
         if self.speaker_manual.isChecked():
             num_speakers = self.speaker_count.value()
         
+        # Get selected transcription language
+        transcription_language = self.language_combo.currentData()
+        strict_language_mode = self.strict_language_mode.isChecked()
+        backend_label = self._selected_backend_label(transcription_language, strict_language_mode)
+        
         # Clear previous transcript
         self.transcript_display.clear()
         self._transcript_segments = []
@@ -587,6 +630,8 @@ class MainWindow(QMainWindow):
         self.speaker_auto.setEnabled(False)
         self.speaker_manual.setEnabled(False)
         self.speaker_count.setEnabled(False)
+        self.language_combo.setEnabled(False)
+        self.strict_language_mode.setEnabled(False)
         self.open_button.setEnabled(False)
         self.youtube_url_input.setEnabled(False)
         self.progress_bar.setVisible(True)
@@ -608,6 +653,8 @@ class MainWindow(QMainWindow):
                 self.speaker_manual.setEnabled(True)
                 if self.speaker_manual.isChecked():
                     self.speaker_count.setEnabled(True)
+                self.language_combo.setEnabled(True)
+                self.strict_language_mode.setEnabled(True)
                 self.open_button.setEnabled(True)
                 self.youtube_url_input.setEnabled(True)
                 self.progress_bar.setVisible(False)
@@ -641,17 +688,21 @@ class MainWindow(QMainWindow):
                     self.speaker_manual.setEnabled(True)
                     if self.speaker_manual.isChecked():
                         self.speaker_count.setEnabled(True)
+                    self.language_combo.setEnabled(True)
+                    self.strict_language_mode.setEnabled(True)
                     self.open_button.setEnabled(True)
                     self.youtube_url_input.setEnabled(True)
                     self.progress_bar.setVisible(False)
                     return
         
-        self.status_bar.showMessage("Processing...")
+        self.status_bar.showMessage(f"Processing... Backend: {backend_label}")
         
         # Create and start worker with pre-loaded pipeline
         self._worker = TranscriptionWorker(
             audio_file=self._current_audio_file,
             num_speakers=num_speakers,
+            transcription_language=transcription_language,
+            strict_language_mode=strict_language_mode,
             pipeline=self._pipeline
         )
         
@@ -716,6 +767,8 @@ class MainWindow(QMainWindow):
         self.speaker_manual.setEnabled(True)
         if self.speaker_manual.isChecked():
             self.speaker_count.setEnabled(True)
+        self.language_combo.setEnabled(True)
+        self.strict_language_mode.setEnabled(True)
         self.open_button.setEnabled(True)
         self.youtube_url_input.setEnabled(True)
         self.progress_bar.setVisible(False)
@@ -747,6 +800,8 @@ class MainWindow(QMainWindow):
         self.speaker_manual.setEnabled(True)
         if self.speaker_manual.isChecked():
             self.speaker_count.setEnabled(True)
+        self.language_combo.setEnabled(True)
+        self.strict_language_mode.setEnabled(True)
         self.open_button.setEnabled(True)
         self.youtube_url_input.setEnabled(True)
         self.progress_bar.setVisible(False)

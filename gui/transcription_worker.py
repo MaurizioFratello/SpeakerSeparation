@@ -57,6 +57,8 @@ class TranscriptionWorker(QThread):
         self,
         audio_file: str,
         num_speakers: Optional[int] = None,
+        transcription_language: str = "auto",
+        strict_language_mode: bool = True,
         pipeline=None,
         parent=None
     ):
@@ -66,12 +68,16 @@ class TranscriptionWorker(QThread):
         Args:
             audio_file: Path to audio file to transcribe
             num_speakers: Number of speakers (None = auto-detect)
+            transcription_language: Language hint for ASR ("auto", "de", "en")
+            strict_language_mode: Force selected language using Whisper (True/False)
             pipeline: Optional pre-loaded Pipeline object (loaded in main thread)
             parent: Parent QObject for Qt parent-child relationship
         """
         super().__init__(parent)
         self.audio_file = audio_file
         self.num_speakers = num_speakers
+        self.transcription_language = transcription_language
+        self.strict_language_mode = strict_language_mode
         self._pipeline = pipeline  # Pre-loaded pipeline to avoid threading issues
         self._temp_wav_path: Optional[str] = None
         self._is_cancelled = False
@@ -147,6 +153,8 @@ class TranscriptionWorker(QThread):
             all_segments = transcribe_audio(
                 audio_file=audio_path,
                 num_speakers=self.num_speakers,
+                transcription_language=self.transcription_language,
+                strict_language_mode=self.strict_language_mode,
                 progress_callback=progress_callback,
                 segment_callback=segment_callback,
                 check_interrupt=check_interrupt,

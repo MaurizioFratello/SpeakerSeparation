@@ -203,6 +203,7 @@ class CustomProgressHook:
         return self.diarization_base_progress + (0.05 * total_diarization_progress)
 import nemo.collections.asr as nemo_asr
 import nemo.collections.common.data.utils as nemo_data_utils
+import whisper as openai_whisper
 
 # Suppress NeMo INFO and DEBUG logging
 # Set NeMo loggers to WARNING level
@@ -228,6 +229,22 @@ if not logger.handlers:
     ))
     logger.addHandler(handler)
     logger.setLevel(logging.WARNING)  # Only show warnings and errors
+
+# ASR model mapping by requested transcription language.
+# By default, all options point to the same multilingual model.
+# You can override with environment variables:
+# - NEMO_ASR_MODEL_AUTO
+# - NEMO_ASR_MODEL_DE
+# - NEMO_ASR_MODEL_EN
+ASR_MODEL_BY_LANGUAGE = {
+    "auto": os.getenv("NEMO_ASR_MODEL_AUTO", "nvidia/parakeet-tdt-0.6b-v3"),
+    "de": os.getenv("NEMO_ASR_MODEL_DE", "nvidia/parakeet-tdt-0.6b-v3"),
+    "en": os.getenv("NEMO_ASR_MODEL_EN", "nvidia/parakeet-tdt-0.6b-v3"),
+}
+WHISPER_MODEL_BY_LANGUAGE = {
+    "de": os.getenv("WHISPER_MODEL_DE", "small"),
+    "en": os.getenv("WHISPER_MODEL_EN", "small"),
+}
 
 # === MPS FIX: Patch move_data_to_device to convert float64 -> float32 ===
 _original_move_data_to_device = nemo_data_utils.move_data_to_device
@@ -278,6 +295,8 @@ def get_device() -> str:
 def transcribe_audio(
     audio_file: str,
     num_speakers: Optional[int] = None,
+    transcription_language: str = "auto",
+    strict_language_mode: bool = True,
     progress_callback: Optional[Callable[[str, float], None]] = None,
     segment_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     check_interrupt: Optional[Callable[[], bool]] = None,
@@ -295,6 +314,8 @@ def transcribe_audio(
     Args:
         audio_file: Path to audio file (supports various formats via ffmpeg)
         num_speakers: Number of speakers (None = auto-detect)
+        transcription_language: Language hint ("auto", "de", "en")
+        strict_language_mode: If True, manual language uses Whisper with fixed language.
         progress_callback: Callback(status_message, progress_0_to_1) for progress updates
         segment_callback: Callback(segment_dict) - called immediately after each chunk
                           for streaming output. Segment dict: {'start': float, 'end': float,
@@ -451,19 +472,41 @@ def transcribe_audio(
     if check_interrupt and check_interrupt():
         return []
     
-    # === STEP 4: TRANSCRIBE WITH PARAKEET (CHUNKED FOR MPS COMPATIBILITY) ===
+    # === STEP 4: TRANSCRIBE AUDIO (LANGUAGE-FORCED WHISPER OR PARAKEET) ===
     if progress_callback:
         progress_callback("Loading transcription model...", 0.35)
-    
-    asr_model = nemo_asr.models.ASRModel.from_pretrained(
-        model_name="nvidia/parakeet-tdt-0.6b-v3"
-    )
-    
-    # Move ASR model to the best available accelerator.
-    # Previously only MPS was handled, which left CUDA runs on CPU.
+
+    language = (transcription_language or "auto").lower()
+    if language not in ASR_MODEL_BY_LANGUAGE:
+        logger.warning(f"Unsupported transcription language '{language}', falling back to auto")
+        language = "auto"
+    use_whisper_forced_language = strict_language_mode and language in WHISPER_MODEL_BY_LANGUAGE
+    asr_model = None
+    whisper_model = None
     device_name = get_device()
-    if device_name in ("mps", "cuda"):
-        asr_model = asr_model.to(torch.device(device_name))
+
+    if use_whisper_forced_language:
+        whisper_model_name = WHISPER_MODEL_BY_LANGUAGE[language]
+        whisper_device = "cuda" if device_name == "cuda" else "cpu"
+        if progress_callback:
+            progress_callback(
+                f"Using Whisper ({whisper_model_name}) with language={language.upper()}",
+                0.36
+            )
+        whisper_model = openai_whisper.load_model(whisper_model_name, device=whisper_device)
+    else:
+        asr_model_name = ASR_MODEL_BY_LANGUAGE[language]
+        if progress_callback and language != "auto":
+            progress_callback(
+                f"Using Parakeet ({asr_model_name}) with language preset={language.upper()}",
+                0.36
+            )
+        asr_model = nemo_asr.models.ASRModel.from_pretrained(
+            model_name=asr_model_name
+        )
+        # Move ASR model to the best available accelerator.
+        if device_name in ("mps", "cuda"):
+            asr_model = asr_model.to(torch.device(device_name))
     
     # Chunking parameters for MPS compatibility (large tensors cause conv2d issues)
     CHUNK_DURATION = 240.0  # 4 minutes per chunk
@@ -507,8 +550,26 @@ def transcribe_audio(
         
         # Transcribe chunk
         try:
-            hypotheses = asr_model.transcribe([tmp_audio_path], timestamps=True)
-            chunk_segments = hypotheses[0].timestamp['segment']
+            if whisper_model is not None:
+                result = whisper_model.transcribe(
+                    tmp_audio_path,
+                    language=language,
+                    task="transcribe",
+                    fp16=(device_name == "cuda"),
+                    verbose=False
+                )
+                whisper_segments = result.get("segments", [])
+                chunk_segments = [
+                    {
+                        "start": seg["start"],
+                        "end": seg["end"],
+                        "segment": seg["text"]
+                    }
+                    for seg in whisper_segments
+                ]
+            else:
+                hypotheses = asr_model.transcribe([tmp_audio_path], timestamps=True)
+                chunk_segments = hypotheses[0].timestamp['segment']
             
             # Adjust timestamps and filter overlap duplicates
             for seg in chunk_segments:
@@ -612,6 +673,8 @@ def main():
     audio_file = sys.argv[1] if len(sys.argv) > 1 else "Music Company Media Productions 10.m4a"
     test_mode = os.getenv('TEST_MODE', 'false').lower() == 'true'
     num_speakers = int(os.getenv('NUM_SPEAKERS', '0')) or None
+    transcription_language = os.getenv('TRANSCRIPTION_LANGUAGE', 'auto').strip().lower()
+    strict_language_mode = os.getenv('STRICT_LANGUAGE_MODE', 'true').strip().lower() in {'1', 'true', 'yes', 'on'}
 
     print("="*60)
     print("Speaker-Attributed Transcription")
@@ -619,6 +682,8 @@ def main():
     print(f"Audio file: {audio_file}")
     print(f"Test mode: {test_mode}")
     print(f"Expected speakers: {num_speakers if num_speakers else 'auto-detect'}")
+    print(f"Transcription language: {transcription_language}")
+    print(f"Strict language mode: {strict_language_mode}")
     print("="*60)
 
     # Progress callback for CLI output
@@ -640,6 +705,8 @@ def main():
         segments = transcribe_audio(
             audio_file=audio_file,
             num_speakers=num_speakers,
+            transcription_language=transcription_language,
+            strict_language_mode=strict_language_mode,
             progress_callback=progress_callback,
             segment_callback=segment_callback
         )
