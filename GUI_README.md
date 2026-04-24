@@ -29,6 +29,9 @@ python gui_main.py
 - **Speaker-Auswahl:**
   - Auto: Automatische Erkennung der Sprecheranzahl
   - Manuell: Vordefinierte Anzahl von Sprechern
+- **Sprach-Auswahl:**
+  - Automatic: Parakeet mit automatischer Sprache
+  - English / German: faster-whisper mit fest vorgegebener Sprache (OpenAI Whisper fallback auf MPS)
 - **Live-Transkript:** Segmente erscheinen in Echtzeit während der Verarbeitung
 - **Auto-Save:** Transkript wird automatisch als `{dateiname}_transcript.txt` gespeichert
 - **YouTube-URL Input:** YouTube-Link einfügen, Audio via yt-dlp laden und verarbeiten
@@ -39,6 +42,8 @@ python gui_main.py
 ## Anforderungen
 
 - **HUGGINGFACE_TOKEN:** Muss in `.env`-Datei vorhanden sein
+- **Transkriptions-Dependencies:** `scripts/requirements_transcription.txt` installieren
+- **Optional:** `WHISPER_MODEL` (Standard: `turbo`) und `WHISPER_BACKEND` (`auto`, `faster-whisper`, `openai-whisper`)
 - **ffmpeg:** Muss im System-PATH verfügbar sein
   - macOS: `brew install ffmpeg`
   - Linux: `sudo apt-get install ffmpeg`
@@ -66,4 +71,3 @@ SpeakerSeparation/
 - **Threading:** QThread für asynchrone Verarbeitung
 - **Streaming:** Live-Updates während der Transkription
 - **Architektur:** MVC-ähnliches Pattern mit Signal/Slot-Kommunikation
-

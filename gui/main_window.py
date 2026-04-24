@@ -17,8 +17,9 @@ from typing import Optional
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QRadioButton, QSpinBox, QTextEdit, QLabel, QFileDialog, QComboBox, QCheckBox,
-    QMessageBox, QProgressBar, QStatusBar, QGroupBox, QButtonGroup, QLineEdit
+    QRadioButton, QSpinBox, QTextEdit, QLabel, QFileDialog,
+    QMessageBox, QProgressBar, QStatusBar, QGroupBox, QButtonGroup, QLineEdit,
+    QComboBox
 )
 from PySide6.QtCore import Qt, QSize, Signal, QTimer
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QFont
@@ -45,6 +46,10 @@ if not logger.handlers:
     ))
     logger.addHandler(handler)
     logger.setLevel(logging.WARNING)  # Only show warnings and errors
+
+# Current pyannote diarization pipeline (HF-gated). Older checkpoints tried only if this fails.
+DEFAULT_DIARIZATION_MODEL_ID = "pyannote/speaker-diarization-3.1"
+FALLBACK_DIARIZATION_MODEL_ID = "pyannote/speaker-diarization-community-1"
 
 
 class DragDropWidget(QLabel):
@@ -143,17 +148,6 @@ class MainWindow(QMainWindow):
     CONTEXT: PySide6 main window pattern. Coordinates between UI components
     and background worker thread via signals/slots.
     """
-    LANGUAGE_OPTIONS = [
-        ("Automatisch", "auto"),
-        ("Deutsch", "de"),
-        ("Englisch", "en"),
-    ]
-
-    def _selected_backend_label(self, language_code: str, strict_mode: bool) -> str:
-        """Return human-readable backend label for current language settings."""
-        if strict_mode and language_code in {"de", "en"}:
-            return f"Whisper ({language_code})"
-        return "Parakeet"
     
     def __init__(self):
         super().__init__()
@@ -226,6 +220,20 @@ class MainWindow(QMainWindow):
                 background-color: #F5F5F7;
                 color: #C7C7CC;
             }
+            QComboBox {
+                background-color: #FFFFFF;
+                border: 1px solid #D1D1D6;
+                border-radius: 6px;
+                padding: 4px 8px;
+                font-size: 13px;
+                color: #1D1D1F;
+                min-width: 260px;
+                min-height: 26px;
+            }
+            QComboBox:disabled {
+                background-color: #F5F5F7;
+                color: #C7C7CC;
+            }
             QProgressBar {
                 border: none;
                 border-radius: 4px;
@@ -273,9 +281,23 @@ class MainWindow(QMainWindow):
         layout.addWidget(youtube_group)
         
         # Settings group
-        settings_group = QGroupBox("Speaker Configuration")
+        settings_group = QGroupBox("Transcription Settings")
         settings_layout = QVBoxLayout()
         settings_layout.setSpacing(12)
+
+        # Language selection
+        language_layout = QHBoxLayout()
+        language_layout.setSpacing(12)
+        language_label = QLabel("Language:")
+        language_label.setStyleSheet("font-size: 13px; color: #1D1D1F; font-weight: 500;")
+        self.language_combo = QComboBox()
+        self.language_combo.addItem("Automatic (Parakeet automatic model)", None)
+        self.language_combo.addItem("English", "en")
+        self.language_combo.addItem("German", "de")
+        language_layout.addWidget(language_label)
+        language_layout.addWidget(self.language_combo)
+        language_layout.addStretch()
+        settings_layout.addLayout(language_layout)
 
         # Speaker selection
         speaker_layout = QHBoxLayout()
@@ -298,33 +320,6 @@ class MainWindow(QMainWindow):
         speaker_layout.addWidget(self.speaker_count)
         speaker_layout.addStretch()
         settings_layout.addLayout(speaker_layout)
-
-        # Language selection for ASR
-        language_layout = QHBoxLayout()
-        language_layout.setSpacing(12)
-        language_label = QLabel("Transkriptionssprache:")
-        self.language_combo = QComboBox()
-        for label, code in self.LANGUAGE_OPTIONS:
-            self.language_combo.addItem(label, code)
-        self.language_combo.setCurrentIndex(0)  # Automatisch
-        self.language_combo.setMinimumWidth(180)
-        language_layout.addWidget(language_label)
-        language_layout.addWidget(self.language_combo)
-        language_layout.addStretch()
-        settings_layout.addLayout(language_layout)
-
-        # Strict language mode: force Whisper for selected manual language
-        strict_layout = QHBoxLayout()
-        strict_layout.setSpacing(12)
-        self.strict_language_mode = QCheckBox("Strikte Sprache erzwingen (Whisper)")
-        self.strict_language_mode.setChecked(True)
-        self.strict_language_mode.setToolTip(
-            "Aktiv: Deutsch/Englisch wird mit Whisper sprachlich erzwungen.\n"
-            "Inaktiv: Parakeet wird verwendet (kann Sprachen mischen)."
-        )
-        strict_layout.addWidget(self.strict_language_mode)
-        strict_layout.addStretch()
-        settings_layout.addLayout(strict_layout)
         
         settings_group.setLayout(settings_layout)
         layout.addWidget(settings_group)
@@ -467,6 +462,79 @@ class MainWindow(QMainWindow):
         if device_name == "mps":
             return "Ready - Using MPS (Apple GPU)"
         return "Ready - Using CPU"
+
+    def _load_pyannote_pipeline(self, model_id: str, token: str):
+        """
+        Load pyannote pipeline with backward/forward auth keyword compatibility.
+
+        pyannote API changed across versions (`token` vs `use_auth_token`).
+        Try modern style first and fall back to legacy keyword when needed.
+        """
+        model_candidates = [model_id, FALLBACK_DIARIZATION_MODEL_ID]
+
+        last_error = None
+        for candidate in model_candidates:
+            try:
+                pipeline = Pipeline.from_pretrained(candidate, token=token)
+                if pipeline is None:
+                    raise RuntimeError(
+                        f"Unable to access '{candidate}'. Ensure Hugging Face token "
+                        "is valid and model terms are accepted on huggingface.co."
+                    )
+                return pipeline
+            except TypeError as exc:
+                message = str(exc)
+                # Newer pyannote auth keyword fallback.
+                if "unexpected keyword argument 'token'" in message:
+                    try:
+                        logger.debug(
+                            f"Falling back to use_auth_token for model {candidate}"
+                        )
+                        pipeline = Pipeline.from_pretrained(
+                            candidate, use_auth_token=token
+                        )
+                        if pipeline is None:
+                            raise RuntimeError(
+                                f"Unable to access '{candidate}'. Ensure Hugging Face "
+                                "token is valid and model terms are accepted on "
+                                "huggingface.co."
+                            )
+                        return pipeline
+                    except TypeError as inner_exc:
+                        # If this specific model is incompatible with installed pyannote
+                        # (e.g. constructor args changed), try next model candidate.
+                        if (
+                            "unexpected keyword argument 'plda'" in str(inner_exc)
+                            and candidate != model_candidates[-1]
+                        ):
+                            logger.warning(
+                                f"Model {candidate} incompatible with current "
+                                "pyannote.audio version, trying alternate model."
+                            )
+                            last_error = inner_exc
+                            continue
+                        raise
+
+                if (
+                    "unexpected keyword argument 'plda'" in message
+                    and candidate != model_candidates[-1]
+                ):
+                    logger.warning(
+                        f"Model {candidate} incompatible with current "
+                        "pyannote.audio version, trying alternate model."
+                    )
+                    last_error = exc
+                    continue
+                raise
+            except Exception as exc:
+                last_error = exc
+                if candidate != model_candidates[-1]:
+                    continue
+                raise
+
+        if last_error:
+            raise last_error
+        raise RuntimeError("Failed to load any compatible pyannote pipeline model.")
     
     def _load_pipeline(self):
         """Load pipeline in main thread."""
@@ -488,9 +556,9 @@ class MainWindow(QMainWindow):
             logger.debug("Calling Pipeline.from_pretrained() in main thread...")
             load_start = time.time()
 
-            self._pipeline = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization-community-1",
-                token=token
+            self._pipeline = self._load_pyannote_pipeline(
+                DEFAULT_DIARIZATION_MODEL_ID,
+                token,
             )
 
             load_elapsed = time.time() - load_start
@@ -612,11 +680,7 @@ class MainWindow(QMainWindow):
         num_speakers = None
         if self.speaker_manual.isChecked():
             num_speakers = self.speaker_count.value()
-        
-        # Get selected transcription language
         transcription_language = self.language_combo.currentData()
-        strict_language_mode = self.strict_language_mode.isChecked()
-        backend_label = self._selected_backend_label(transcription_language, strict_language_mode)
         
         # Clear previous transcript
         self.transcript_display.clear()
@@ -631,7 +695,6 @@ class MainWindow(QMainWindow):
         self.speaker_manual.setEnabled(False)
         self.speaker_count.setEnabled(False)
         self.language_combo.setEnabled(False)
-        self.strict_language_mode.setEnabled(False)
         self.open_button.setEnabled(False)
         self.youtube_url_input.setEnabled(False)
         self.progress_bar.setVisible(True)
@@ -654,7 +717,6 @@ class MainWindow(QMainWindow):
                 if self.speaker_manual.isChecked():
                     self.speaker_count.setEnabled(True)
                 self.language_combo.setEnabled(True)
-                self.strict_language_mode.setEnabled(True)
                 self.open_button.setEnabled(True)
                 self.youtube_url_input.setEnabled(True)
                 self.progress_bar.setVisible(False)
@@ -668,9 +730,9 @@ class MainWindow(QMainWindow):
                     if not token:
                         raise RuntimeError("HUGGINGFACE_TOKEN not found in .env file")
                     
-                    self._pipeline = Pipeline.from_pretrained(
-                        "pyannote/speaker-diarization-community-1",
-                        token=token
+                    self._pipeline = self._load_pyannote_pipeline(
+                        DEFAULT_DIARIZATION_MODEL_ID,
+                        token,
                     )
                     
                     device_name = self._detect_device_name()
@@ -689,20 +751,18 @@ class MainWindow(QMainWindow):
                     if self.speaker_manual.isChecked():
                         self.speaker_count.setEnabled(True)
                     self.language_combo.setEnabled(True)
-                    self.strict_language_mode.setEnabled(True)
                     self.open_button.setEnabled(True)
                     self.youtube_url_input.setEnabled(True)
                     self.progress_bar.setVisible(False)
                     return
         
-        self.status_bar.showMessage(f"Processing... Backend: {backend_label}")
+        self.status_bar.showMessage("Processing...")
         
         # Create and start worker with pre-loaded pipeline
         self._worker = TranscriptionWorker(
             audio_file=self._current_audio_file,
             num_speakers=num_speakers,
             transcription_language=transcription_language,
-            strict_language_mode=strict_language_mode,
             pipeline=self._pipeline
         )
         
@@ -768,7 +828,6 @@ class MainWindow(QMainWindow):
         if self.speaker_manual.isChecked():
             self.speaker_count.setEnabled(True)
         self.language_combo.setEnabled(True)
-        self.strict_language_mode.setEnabled(True)
         self.open_button.setEnabled(True)
         self.youtube_url_input.setEnabled(True)
         self.progress_bar.setVisible(False)
@@ -801,7 +860,6 @@ class MainWindow(QMainWindow):
         if self.speaker_manual.isChecked():
             self.speaker_count.setEnabled(True)
         self.language_combo.setEnabled(True)
-        self.strict_language_mode.setEnabled(True)
         self.open_button.setEnabled(True)
         self.youtube_url_input.setEnabled(True)
         self.progress_bar.setVisible(False)
@@ -903,4 +961,3 @@ class MainWindow(QMainWindow):
                 return
 
         event.accept()
-

@@ -1,0 +1,6 @@
+# FastAPI microservice (use with scripts/requirements_ml.txt in Docker).
+
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-dotenv>=1.0.0
+pydantic>=2.0

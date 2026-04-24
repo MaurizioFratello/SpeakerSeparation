@@ -1,0 +1,5 @@
+# Keep CUDA wheels aligned with the pytorch/pytorch base image (cu124).
+# Used as: pip install -c docker_constraints.txt ...
+torch==2.5.1+cu124
+torchvision==0.20.1+cu124
+torchaudio==2.5.1+cu124

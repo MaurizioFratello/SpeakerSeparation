@@ -1,0 +1,40 @@
+# SpeakerSeparation CUDA microservice (single GPU host).
+# Prerequisites: NVIDIA driver + nvidia-container-toolkit.
+#
+# Usage:
+#   mkdir -p data exports
+#   cp .env.example .env   # set HUGGINGFACE_TOKEN
+#   docker compose up --build
+#
+# Put audio under ./data (e.g. ./data/sample.wav) and POST audio_path: "/data/sample.wav".
+
+services:
+  transcription:
+    build: .
+    image: speaker-separation-cuda:latest
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      SERVICE_HOST: "0.0.0.0"
+      SERVICE_PORT: "8080"
+      SERVICE_DATA_DIR: "/data"
+      SERVICE_OUTPUT_DIR: "/exports"
+      SERVICE_DB_PATH: "/var/lib/transcription/jobs.db"
+      SERVICE_CACHE_ROOT: "/cache"
+      SERVICE_REQUIRE_CUDA: "true"
+      SERVICE_MAX_QUEUED_JOBS: "16"
+      SERVICE_JOB_TIMEOUT_SEC: "14400"
+      # Optional: SERVICE_API_TOKEN=your-secret
+    volumes:
+      - ./data:/data:ro
+      - ./exports:/exports
+      - transcription_cache:/cache
+      - transcription_db:/var/lib/transcription
+    gpus: all
+    restart: unless-stopped
+
+volumes:
+  transcription_cache:
+  transcription_db:

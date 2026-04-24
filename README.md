@@ -41,6 +41,16 @@ TEST_MODE=true NUM_SPEAKERS=2 python transcribe_simple.py "your_audio.m4a"
 - **Test Audio**: 2 minutes → ~7 seconds processing
 - **Full Audio**: 44.7 minutes → ~20-30 minutes estimated
 
+## Microservice (CUDA + Docker)
+
+Headless async API for LLM agents: **create job → poll status → fetch result**. See [docs/MICROSERVICE_API.md](docs/MICROSERVICE_API.md) and `docker-compose.yml`.
+
+```bash
+cp .env.example .env   # set HUGGINGFACE_TOKEN
+mkdir -p data exports
+docker compose up --build
+```
+
 ## Project Structure
 
 ```
