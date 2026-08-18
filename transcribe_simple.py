@@ -31,6 +31,8 @@ os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(_hf_hub_cache))
 
 os.environ['PYANNOTE_METRICS_ENABLED'] = '0'
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'  # Enable MPS fallback for NeMo
+# Expandable CUDA segments can assert under WSL/multi-GPU memory pressure.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:False")
 
 # Suppress NeMo logging (INFO and below) - set before importing nemo
 os.environ['NEMO_LOGGING_LEVEL'] = 'WARNING'
@@ -71,8 +73,8 @@ from pyannote.audio import Pipeline
 from pyannote.audio.pipelines.utils.hook import ProgressHook
 from pyannote.core import Segment
 
-DEFAULT_DIARIZATION_MODEL_ID = "pyannote/speaker-diarization-3.1"
-FALLBACK_DIARIZATION_MODEL_ID = "pyannote/speaker-diarization-community-1"
+DEFAULT_DIARIZATION_MODEL_ID = "pyannote/speaker-diarization-community-1"
+FALLBACK_DIARIZATION_MODEL_ID = "pyannote/speaker-diarization-3.1"
 PARAKEET_MODEL_ID = "nvidia/parakeet-tdt-0.6b-v3"
 DEFAULT_WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "").strip() or "turbo"
 DEFAULT_WHISPER_BACKEND = os.getenv("WHISPER_BACKEND", "auto").strip().lower()
@@ -147,6 +149,23 @@ def load_diarization_pipeline(token: str, model_id: str = DEFAULT_DIARIZATION_MO
     if last_error:
         raise last_error
     raise RuntimeError("Failed to load any compatible pyannote pipeline model.")
+
+
+def extract_diarization_annotation(diarization, *, exclusive: bool = True):
+    """
+    Return the Annotation used to assign speakers to ASR segments.
+
+    community-1 / pyannote 4 return DiarizeOutput. Exclusive diarization has no
+    overlapping turns, which matches transcription timestamps more cleanly.
+    """
+    if exclusive:
+        exclusive_annotation = getattr(diarization, "exclusive_speaker_diarization", None)
+        if exclusive_annotation is not None:
+            return exclusive_annotation
+    speaker_annotation = getattr(diarization, "speaker_diarization", None)
+    if speaker_annotation is not None:
+        return speaker_annotation
+    return diarization
 
 
 class CustomProgressHook:
@@ -368,23 +387,109 @@ def _mps_safe_move_data_to_device(inputs, device, non_blocking=True):
 nemo_data_utils.move_data_to_device = _mps_safe_move_data_to_device
 # === END MPS FIX ===
 
+def _nvidia_smi_free_mib_by_name() -> Dict[str, int]:
+    """
+    Read host-visible free VRAM from nvidia-smi.
+
+    In WSL, torch.cuda.mem_get_info() often ignores Windows processes that
+    already occupy a GPU. nvidia-smi reports that occupancy.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return {}
+
+    mapping: Dict[str, int] = {}
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line or "," not in line:
+            continue
+        name, free = line.rsplit(",", 1)
+        try:
+            mapping[name.strip()] = int(float(free.strip()))
+        except ValueError:
+            continue
+    return mapping
+
+
+def _smi_free_mib_for_device(device_name: str, smi_free: Dict[str, int]) -> Optional[int]:
+    if device_name in smi_free:
+        return smi_free[device_name]
+    lowered = device_name.lower()
+    for smi_name, free in smi_free.items():
+        if smi_name.lower() == lowered:
+            return free
+    return None
+
+
+def _select_cuda_device_index() -> int:
+    """Return the CUDA index with the most host-visible free memory."""
+    count = torch.cuda.device_count()
+    if count <= 1:
+        return 0
+
+    smi_free = _nvidia_smi_free_mib_by_name()
+    best_idx = 0
+    best_free = -1
+    for idx in range(count):
+        name = torch.cuda.get_device_name(idx)
+        free_mib = _smi_free_mib_for_device(name, smi_free)
+        if free_mib is None:
+            try:
+                free_bytes, _ = torch.cuda.mem_get_info(idx)
+                free_mib = int(free_bytes / (1024 * 1024))
+            except Exception:
+                free_mib = 0
+        if free_mib > best_free:
+            best_free = free_mib
+            best_idx = idx
+    return best_idx
+
+
 def get_device(for_whisper: bool = False) -> str:
     """
     Detect the best available device for PyTorch.
     Priority: CUDA (NVIDIA GPU) > MPS (Apple Silicon GPU) > CPU
 
+    On multi-GPU machines, CUDA selection prefers the device with the most
+    free VRAM according to nvidia-smi (important in WSL, where Windows apps
+    can fill a GPU that torch still reports as free).
+
     The for_whisper argument is retained for compatibility with older callers.
     Whisper now uses the same accelerator preference as the rest of the app.
 
     Returns:
-        Device string: 'cuda', 'mps', or 'cpu'
+        Device string: 'cuda', 'cuda:N', 'mps', or 'cpu'
     """
     if torch.cuda.is_available():
+        idx = _select_cuda_device_index()
+        if idx != 0:
+            torch.cuda.set_device(idx)
+            return f"cuda:{idx}"
         return "cuda"
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return "mps"
     else:
         return "cpu"
+
+
+def prepare_diarization_pipeline(pipeline, device_name: str):
+    """Select one device and move all diarization inference components to it."""
+    device = torch.device(device_name)
+    if device.type == "cuda":
+        torch.cuda.set_device(device.index or 0)
+    pipeline.to(device)
+    return pipeline
 
 
 def normalize_transcription_language(language: Optional[str]) -> Optional[str]:
@@ -851,8 +956,10 @@ def transcribe_audio(
     logger.debug(f"transcribe_audio() called at {function_start:.2f}")
     
     # === STEP 1: LOAD DIARIZATION PIPELINE ===
-    # If pipeline is provided, use it (loaded in main thread to avoid threading issues)
-    # Otherwise, load it here (may be slow in worker thread)
+    # GUI pipelines are preloaded and pinned to one CUDA device. Do not move
+    # them again from a new QThread: repeated cross-thread CUDA migrations can
+    # corrupt PyTorch's caching allocator.
+    pipeline_was_preloaded = pipeline is not None
     if pipeline is None:
         pipeline_start = time.time()
         logger.debug(f"Starting pipeline loading at {pipeline_start:.2f}")
@@ -884,25 +991,18 @@ def transcribe_audio(
         if progress_callback:
             progress_callback("Pipeline loaded, moving to device...", 0.08)
         
-        # Move pipeline to best available device
-        device_start = time.time()
-        device_name = get_device()
-        logger.debug(f"Moving pipeline to device: {device_name}")
-        device = torch.device(device_name)
-        pipeline.to(device)
-        device_elapsed = time.time() - device_start
-        logger.debug(f"Pipeline moved to device in {device_elapsed:.2f}s")
-        
-        if progress_callback:
-            progress_callback(f"Pipeline ready on {device_name.upper()}", 0.1)
     else:
-        # Pipeline already loaded - assume it's already on the correct device
-        # (was moved to device when loaded in main thread)
         logger.debug("Using pre-loaded pipeline")
         if progress_callback:
             progress_callback("Using pre-loaded pipeline...", 0.05)
-        
+
+    if not pipeline_was_preloaded:
+        device_start = time.time()
         device_name = get_device()
+        logger.debug(f"Preparing pipeline on device: {device_name}")
+        prepare_diarization_pipeline(pipeline, device_name)
+        device_elapsed = time.time() - device_start
+        logger.debug(f"Pipeline prepared on {device_name} in {device_elapsed:.2f}s")
         if progress_callback:
             progress_callback(f"Pipeline ready on {device_name.upper()}", 0.1)
     
@@ -967,11 +1067,8 @@ def transcribe_audio(
     pipeline_call_elapsed = time.time() - pipeline_call_start
     logger.debug(f"pipeline() call completed in {pipeline_call_elapsed:.2f}s")
     
-    # Extract annotation
-    if hasattr(diarization, 'speaker_diarization'):
-        annotation = diarization.speaker_diarization
-    else:
-        annotation = diarization
+    # Extract annotation (prefer exclusive turns for ASR speaker assignment)
+    annotation = extract_diarization_annotation(diarization)
     
     speakers_found = len(annotation.labels())
     diarization_elapsed = time.time() - diarization_start

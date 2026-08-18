@@ -1,31 +1,85 @@
 """
 Audio format conversion utilities for GUI.
 
-PURPOSE: Convert various audio formats (MP3, M4A, WAV, AIFF, FLAC) to WAV format
+PURPOSE: Convert audio and video files (MP3, M4A, MP4, WAV, ...) to WAV format
 required by the transcription backend (16kHz, mono, PCM).
 
 CONTEXT: The backend expects audio in a specific format. This module handles
-format detection and conversion using ffmpeg, creating temporary files that
-are cleaned up after processing.
+format detection, Windows-to-WSL path mapping, and conversion using ffmpeg.
 """
 
 import os
+import re
 import subprocess
 import tempfile
-from typing import Optional
 from pathlib import Path
 
 
-# Supported input formats
-SUPPORTED_FORMATS = {'.mp3', '.m4a', '.wav', '.aiff', '.aif', '.flac', '.ogg', '.wma', '.webm'}
+SUPPORTED_AUDIO_FORMATS = {'.mp3', '.m4a', '.wav', '.aiff', '.aif', '.flac', '.ogg', '.wma', '.webm'}
+SUPPORTED_VIDEO_FORMATS = {'.mp4', '.mkv', '.mov', '.avi', '.m4v', '.mpeg', '.mpg'}
+SUPPORTED_FORMATS = SUPPORTED_AUDIO_FORMATS | SUPPORTED_VIDEO_FORMATS
+SUPPORTED_FORMATS_LABEL = "MP3, M4A, WAV, AIFF, FLAC, OGG, WMA, WEBM, MP4, MKV, MOV, AVI, M4V"
+
+_DIALOG_EXTS = " ".join(f"*{ext}" for ext in sorted(SUPPORTED_FORMATS))
+FILE_DIALOG_FILTER = f"Audio & Video ({_DIALOG_EXTS});;All Files (*)"
+
+_DRIVE_PATH_RE = re.compile(r"^([A-Za-z]):[\\/](.*)$")
+_WSL_UNC_RE = re.compile(
+    r"^[/\\]{2}(?:wsl\.localhost|wsl\$)[/\\][^/\\]+[/\\](.*)$",
+    re.IGNORECASE,
+)
+
+
+def running_in_wsl() -> bool:
+    """Return True when this process is running inside WSL."""
+    if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+        return True
+    try:
+        return "microsoft" in Path("/proc/version").read_text(
+            encoding="utf-8", errors="ignore"
+        ).lower()
+    except OSError:
+        return False
+
+
+def normalize_input_path(file_path: str) -> str:
+    """
+    Map Windows / WSLg paths to a local path this process can open.
+
+    Drag-and-drop from Explorer onto a WSL GUI often yields ``E:\\...`` or
+    ``\\\\wsl.localhost\\Ubuntu\\...`` instead of ``/mnt/e/...``.
+    """
+    if not file_path:
+        return file_path
+
+    path = file_path.strip().strip('"')
+    if path.lower().startswith("file://"):
+        path = path[7:]
+        if re.match(r"^/[A-Za-z]:", path):
+            path = path[1:]
+
+    if not running_in_wsl():
+        return path
+
+    unc = _WSL_UNC_RE.match(path)
+    if unc:
+        rest = unc.group(1).replace("\\", "/")
+        return rest if rest.startswith("/") else f"/{rest}"
+
+    drive = _DRIVE_PATH_RE.match(path)
+    if drive:
+        rest = drive.group(2).replace("\\", "/")
+        return f"/mnt/{drive.group(1).lower()}/{rest}"
+
+    return path.replace("\\", "/") if "\\" in path else path
 
 
 def is_supported_format(file_path: str) -> bool:
     """
-    Check if audio file format is supported.
+    Check if audio/video file format is supported.
     
     Args:
-        file_path: Path to audio file
+        file_path: Path to media file
     
     Returns:
         True if format is supported, False otherwise
@@ -36,16 +90,16 @@ def is_supported_format(file_path: str) -> bool:
 
 def convert_to_wav(input_file: str) -> str:
     """
-    Convert audio file to WAV format required by backend.
+    Convert audio or video file to WAV format required by backend.
     
-    PURPOSE: Convert any supported audio format to 16kHz mono WAV for processing.
+    PURPOSE: Convert any supported media format to 16kHz mono WAV for processing.
     Uses ffmpeg for conversion, creating a temporary file that must be cleaned up.
     
     CONTEXT: Backend requires specific audio format (16kHz, mono, PCM). This function
-    handles format detection and conversion transparently.
+    handles Windows/WSL path mapping, format detection, and conversion transparently.
     
     Args:
-        input_file: Path to input audio file (any supported format)
+        input_file: Path to input audio or video file (any supported format)
     
     Returns:
         Path to temporary WAV file (must be cleaned up by caller)
@@ -56,6 +110,8 @@ def convert_to_wav(input_file: str) -> str:
         subprocess.CalledProcessError: If ffmpeg conversion fails
         RuntimeError: If ffmpeg is not installed or not found in PATH
     """
+    input_file = normalize_input_path(input_file)
+
     if not os.path.exists(input_file):
         raise FileNotFoundError(f"Audio file not found: {input_file}")
     
@@ -99,6 +155,7 @@ def convert_to_wav(input_file: str) -> str:
         cmd = [
             'ffmpeg',
             '-i', input_file,
+            '-vn',               # Ignore video streams (meeting recordings, etc.)
             '-ar', '16000',      # Sample rate: 16kHz
             '-ac', '1',          # Channels: mono
             '-acodec', 'pcm_s16le',  # Codec: PCM 16-bit little-endian

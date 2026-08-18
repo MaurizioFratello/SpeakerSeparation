@@ -32,8 +32,9 @@ class TestDeviceDetection(unittest.TestCase):
         """Test that CUDA is preferred when available."""
         with patch('torch.cuda.is_available', return_value=True):
             with patch('torch.backends.mps.is_available', return_value=True):
-                device = get_device()
-                self.assertEqual(device, "cuda", "CUDA should be preferred over MPS")
+                with patch.object(transcribe_simple, "_select_cuda_device_index", return_value=0):
+                    device = get_device()
+                    self.assertEqual(device, "cuda", "CUDA should be preferred over MPS")
 
     def test_mps_detection(self):
         """Test that MPS is selected on Apple Silicon."""
@@ -59,17 +60,24 @@ class TestDeviceDetection(unittest.TestCase):
     def test_whisper_allows_cuda(self):
         """Test that Whisper can use CUDA when available."""
         with patch('torch.cuda.is_available', return_value=True):
-            device = get_device(for_whisper=True)
-            self.assertEqual(device, "cuda", "Whisper should use CUDA when available")
+            with patch.object(transcribe_simple, "_select_cuda_device_index", return_value=0):
+                device = get_device(for_whisper=True)
+                self.assertEqual(device, "cuda", "Whisper should use CUDA when available")
 
     def test_actual_device_detection(self):
         """Test actual device detection on current hardware."""
         device = get_device()
-        self.assertIn(device, ["cuda", "mps", "cpu"], "Device should be one of the valid options")
+        self.assertTrue(
+            device in ("mps", "cpu") or device == "cuda" or device.startswith("cuda:"),
+            "Device should be one of the valid options",
+        )
 
         # Verify it matches torch's actual capabilities
         if torch.cuda.is_available():
-            self.assertEqual(device, "cuda", "Should detect CUDA when available")
+            self.assertTrue(
+                device == "cuda" or device.startswith("cuda:"),
+                "Should detect CUDA when available",
+            )
         elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             self.assertEqual(device, "mps", "Should detect MPS when available")
         else:
@@ -172,6 +180,37 @@ class TestDeviceDetection(unittest.TestCase):
         self.assertEqual(merged[0]["text"], "Hello again")
         self.assertEqual(merged[1]["text"], "Guten Tag")
         self.assertEqual(emitted, merged)
+
+    def test_select_cuda_device_prefers_smi_free_memory(self):
+        """WSL should pick the GPU nvidia-smi reports as actually free."""
+        smi = {
+            "NVIDIA GeForce RTX 5090": 30000,
+            "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": 500,
+        }
+        names = [
+            "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+            "NVIDIA GeForce RTX 5090",
+        ]
+        with patch.object(transcribe_simple, "_nvidia_smi_free_mib_by_name", return_value=smi), \
+             patch("torch.cuda.device_count", return_value=2), \
+             patch("torch.cuda.get_device_name", side_effect=lambda i: names[i]):
+            self.assertEqual(transcribe_simple._select_cuda_device_index(), 1)
+
+    def test_get_device_returns_cuda_index_when_not_zero(self):
+        with patch("torch.cuda.is_available", return_value=True), \
+             patch.object(transcribe_simple, "_select_cuda_device_index", return_value=1):
+            self.assertEqual(get_device(), "cuda:1")
+
+    def test_parse_nvidia_smi_free_memory_by_name(self):
+        smi_output = (
+            "NVIDIA GeForce RTX 5090, 29965\n"
+            "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 558\n"
+        )
+        fake = MagicMock(stdout=smi_output)
+        with patch.object(transcribe_simple.subprocess, "run", return_value=fake):
+            mapping = transcribe_simple._nvidia_smi_free_mib_by_name()
+        self.assertEqual(mapping["NVIDIA GeForce RTX 5090"], 29965)
+        self.assertEqual(mapping["NVIDIA RTX PRO 6000 Blackwell Workstation Edition"], 558)
 
 
 if __name__ == "__main__":

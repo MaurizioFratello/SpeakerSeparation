@@ -24,19 +24,25 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QSize, Signal, QTimer
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QFont
 
+from transcribe_simple import (
+    get_device,
+    load_diarization_pipeline,
+    prepare_diarization_pipeline,
+)
 from gui.transcription_worker import TranscriptionWorker
-from gui.audio_converter import is_supported_format
+from gui.audio_converter import (
+    FILE_DIALOG_FILTER,
+    SUPPORTED_FORMATS_LABEL,
+    is_supported_format,
+    normalize_input_path,
+)
 from gui.markdown_export import segments_to_markdown, merge_consecutive_same_speaker
 from gui.youtube_download import download_youtube_audio, is_youtube_url
 
-# Import for pipeline loading
 from dotenv import load_dotenv
 load_dotenv()
-from pyannote.audio import Pipeline
 import torch
 
-# Setup logging - use separate logger to avoid conflicts
-# Set to WARNING level to suppress debug/info messages
 logger = logging.getLogger('main_window')
 if not logger.handlers:
     handler = logging.StreamHandler()
@@ -45,11 +51,7 @@ if not logger.handlers:
         datefmt='%H:%M:%S'
     ))
     logger.addHandler(handler)
-    logger.setLevel(logging.WARNING)  # Only show warnings and errors
-
-# Current pyannote diarization pipeline (HF-gated). Older checkpoints tried only if this fails.
-DEFAULT_DIARIZATION_MODEL_ID = "pyannote/speaker-diarization-3.1"
-FALLBACK_DIARIZATION_MODEL_ID = "pyannote/speaker-diarization-community-1"
+    logger.setLevel(logging.WARNING)
 
 
 class DragDropWidget(QLabel):
@@ -82,7 +84,10 @@ class DragDropWidget(QLabel):
                 background-color: #EBF5FF;
             }
         """)
-        self.setText("Drop audio file here or click to select\n\nSupported formats: MP3, M4A, WAV, AIFF, FLAC, WEBM")
+        self.setText(
+            "Drop audio or video file here or click to select\n\n"
+            f"Supported formats: {SUPPORTED_FORMATS_LABEL}"
+        )
         self._original_style = self.styleSheet()
     
     def dragEnterEvent(self, event: QDragEnterEvent):
@@ -90,7 +95,7 @@ class DragDropWidget(QLabel):
         if event.mimeData().hasUrls():
             urls = event.mimeData().urls()
             if urls and len(urls) == 1:
-                file_path = urls[0].toLocalFile()
+                file_path = normalize_input_path(urls[0].toLocalFile())
                 if os.path.isfile(file_path) and is_supported_format(file_path):
                     event.acceptProposedAction()
                     self.setStyleSheet("""
@@ -116,7 +121,7 @@ class DragDropWidget(QLabel):
         """Handle file drop - emit signal with file path."""
         urls = event.mimeData().urls()
         if urls:
-            file_path = urls[0].toLocalFile()
+            file_path = normalize_input_path(urls[0].toLocalFile())
             self.fileDropped.emit(file_path)
         self.setStyleSheet(self._original_style)
         event.acceptProposedAction()
@@ -130,12 +135,12 @@ class DragDropWidget(QLabel):
         """Open file selection dialog."""
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Audio-Datei auswählen",
+            "Audio- oder Videodatei auswählen",
             "",
-            "Audio Files (*.mp3 *.m4a *.wav *.aiff *.aif *.flac *.ogg *.wma *.webm);;All Files (*)"
+            FILE_DIALOG_FILTER,
         )
         if file_path:
-            self.fileDropped.emit(file_path)
+            self.fileDropped.emit(normalize_input_path(file_path))
 
 
 class MainWindow(QMainWindow):
@@ -444,98 +449,22 @@ class MainWindow(QMainWindow):
 
     def _detect_device_name(self) -> str:
         """Detect preferred inference device."""
-        if torch.cuda.is_available():
-            return "cuda"
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return "mps"
-        return "cpu"
+        return get_device()
 
     def _device_status_message(self) -> str:
         """Build a human-readable startup status message for the status bar."""
         device_name = self._detect_device_name()
-        if device_name == "cuda":
+        if device_name.startswith("cuda"):
             try:
-                gpu_name = torch.cuda.get_device_name(0)
+                idx = int(device_name.split(":")[1]) if ":" in device_name else 0
+                gpu_name = torch.cuda.get_device_name(idx)
                 return f"Ready - Using CUDA: {gpu_name}"
             except Exception:
-                return "Ready - Using CUDA"
+                return f"Ready - Using {device_name.upper()}"
         if device_name == "mps":
             return "Ready - Using MPS (Apple GPU)"
         return "Ready - Using CPU"
 
-    def _load_pyannote_pipeline(self, model_id: str, token: str):
-        """
-        Load pyannote pipeline with backward/forward auth keyword compatibility.
-
-        pyannote API changed across versions (`token` vs `use_auth_token`).
-        Try modern style first and fall back to legacy keyword when needed.
-        """
-        model_candidates = [model_id, FALLBACK_DIARIZATION_MODEL_ID]
-
-        last_error = None
-        for candidate in model_candidates:
-            try:
-                pipeline = Pipeline.from_pretrained(candidate, token=token)
-                if pipeline is None:
-                    raise RuntimeError(
-                        f"Unable to access '{candidate}'. Ensure Hugging Face token "
-                        "is valid and model terms are accepted on huggingface.co."
-                    )
-                return pipeline
-            except TypeError as exc:
-                message = str(exc)
-                # Newer pyannote auth keyword fallback.
-                if "unexpected keyword argument 'token'" in message:
-                    try:
-                        logger.debug(
-                            f"Falling back to use_auth_token for model {candidate}"
-                        )
-                        pipeline = Pipeline.from_pretrained(
-                            candidate, use_auth_token=token
-                        )
-                        if pipeline is None:
-                            raise RuntimeError(
-                                f"Unable to access '{candidate}'. Ensure Hugging Face "
-                                "token is valid and model terms are accepted on "
-                                "huggingface.co."
-                            )
-                        return pipeline
-                    except TypeError as inner_exc:
-                        # If this specific model is incompatible with installed pyannote
-                        # (e.g. constructor args changed), try next model candidate.
-                        if (
-                            "unexpected keyword argument 'plda'" in str(inner_exc)
-                            and candidate != model_candidates[-1]
-                        ):
-                            logger.warning(
-                                f"Model {candidate} incompatible with current "
-                                "pyannote.audio version, trying alternate model."
-                            )
-                            last_error = inner_exc
-                            continue
-                        raise
-
-                if (
-                    "unexpected keyword argument 'plda'" in message
-                    and candidate != model_candidates[-1]
-                ):
-                    logger.warning(
-                        f"Model {candidate} incompatible with current "
-                        "pyannote.audio version, trying alternate model."
-                    )
-                    last_error = exc
-                    continue
-                raise
-            except Exception as exc:
-                last_error = exc
-                if candidate != model_candidates[-1]:
-                    continue
-                raise
-
-        if last_error:
-            raise last_error
-        raise RuntimeError("Failed to load any compatible pyannote pipeline model.")
-    
     def _load_pipeline(self):
         """Load pipeline in main thread."""
         if self._pipeline is not None:
@@ -556,20 +485,16 @@ class MainWindow(QMainWindow):
             logger.debug("Calling Pipeline.from_pretrained() in main thread...")
             load_start = time.time()
 
-            self._pipeline = self._load_pyannote_pipeline(
-                DEFAULT_DIARIZATION_MODEL_ID,
-                token,
-            )
+            self._pipeline = load_diarization_pipeline(token)
 
             load_elapsed = time.time() - load_start
             logger.debug(f"Pipeline.from_pretrained() completed in {load_elapsed:.2f}s")
 
             # Move to device
             device_name = self._detect_device_name()
-            device = torch.device(device_name)
-            self._pipeline.to(device)
+            prepare_diarization_pipeline(self._pipeline, device_name)
 
-            logger.debug(f"Pipeline loaded and moved to {device_name}")
+            logger.debug(f"Pipeline loaded and pinned to {device_name}")
             self.status_bar.showMessage(self._device_status_message())
             self._pipeline_loading = False
 
@@ -581,6 +506,7 @@ class MainWindow(QMainWindow):
     
     def _on_file_selected(self, file_path: str):
         """Handle file selection from drag & drop or file dialog."""
+        file_path = normalize_input_path(file_path)
         if not os.path.exists(file_path):
             QMessageBox.warning(self, "Fehler", f"Datei nicht gefunden: {file_path}")
             return
@@ -591,7 +517,7 @@ class MainWindow(QMainWindow):
                 self,
                 "Nicht unterstütztes Format",
                 f"Das Format '{ext}' wird nicht unterstützt.\n\n"
-                f"Unterstützte Formate: MP3, M4A, WAV, AIFF, FLAC, OGG, WMA, WEBM"
+                f"Unterstützte Formate: {SUPPORTED_FORMATS_LABEL}"
             )
             return
 
@@ -629,16 +555,19 @@ class MainWindow(QMainWindow):
             self.drag_drop.setText(f"{filename}\n\nClick to change selection")
             self.start_button.setEnabled(True)
         else:
-            self.drag_drop.setText("Drop audio file here or click to select\n\nSupported formats: MP3, M4A, WAV, AIFF, FLAC, WEBM")
+            self.drag_drop.setText(
+                "Drop audio or video file here or click to select\n\n"
+                f"Supported formats: {SUPPORTED_FORMATS_LABEL}"
+            )
             self.start_button.setEnabled(False)
     
     def _on_open_clicked(self):
         """Open file dialog for audio file selection."""
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Audio-Datei auswählen",
+            "Audio- oder Videodatei auswählen",
             "",
-            "Audio Files (*.mp3 *.m4a *.wav *.aiff *.aif *.flac *.ogg *.wma *.webm);;All Files (*)"
+            FILE_DIALOG_FILTER,
         )
         if file_path:
             self._on_file_selected(file_path)
@@ -730,15 +659,11 @@ class MainWindow(QMainWindow):
                     if not token:
                         raise RuntimeError("HUGGINGFACE_TOKEN not found in .env file")
                     
-                    self._pipeline = self._load_pyannote_pipeline(
-                        DEFAULT_DIARIZATION_MODEL_ID,
-                        token,
-                    )
+                    self._pipeline = load_diarization_pipeline(token)
                     
                     device_name = self._detect_device_name()
-                    device = torch.device(device_name)
-                    self._pipeline.to(device)
-                    logger.debug(f"Pipeline loaded and moved to {device_name}")
+                    prepare_diarization_pipeline(self._pipeline, device_name)
+                    logger.debug(f"Pipeline loaded and pinned to {device_name}")
                 except Exception as e:
                     logger.error(f"Pipeline loading failed: {e}", exc_info=True)
                     QMessageBox.critical(self, "Fehler", f"Pipeline konnte nicht geladen werden:\n{str(e)}")
