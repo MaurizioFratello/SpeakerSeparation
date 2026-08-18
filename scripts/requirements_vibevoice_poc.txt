@@ -1,0 +1,12 @@
+# Isolated deps for the VibeVoice-ASR Gradio POC (app_vibevoice.py).
+# Install: uv pip install -r scripts/requirements_vibevoice_poc.txt
+
+python-dotenv
+gradio>=4.0
+soundfile
+librosa
+accelerate
+transformers>=4.51.3,<5.0.0
+torch
+torchaudio
+vibevoice @ git+https://github.com/microsoft/VibeVoice.git

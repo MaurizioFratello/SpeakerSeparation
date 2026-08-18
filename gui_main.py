@@ -26,6 +26,7 @@ _hf_hub_cache.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("XDG_CACHE_HOME", str(_cache_root))
 os.environ.setdefault("HF_HOME", str(_hf_home))
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(_hf_hub_cache))
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:False")
 
 # PyTorch 2.6+ defaults torch.load(..., weights_only=True). pyannote checkpoints
 # loaded via Lightning still need full unpickling (Hugging Face weights = trusted).

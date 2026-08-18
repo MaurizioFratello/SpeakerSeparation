@@ -1,7 +1,7 @@
 # CUDA-enabled transcription microservice.
 # Host needs NVIDIA Container Toolkit and a compatible driver.
 # PyTorch image tag: adjust if you need a different CUDA minor version.
-FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -18,7 +18,7 @@ COPY scripts/requirements_ml.txt scripts/requirements_service.txt \
     scripts/docker_constraints.txt /app/scripts/
 # Constrain torch* to match the CUDA 12.4 runtime base image (avoid pip upgrading to CPU/other CUDA builds).
 RUN pip install --no-cache-dir \
-    --extra-index-url https://download.pytorch.org/whl/cu124 \
+    --extra-index-url https://download.pytorch.org/whl/cu128 \
     -c /app/scripts/docker_constraints.txt \
     -r /app/scripts/requirements_ml.txt \
     -r /app/scripts/requirements_service.txt

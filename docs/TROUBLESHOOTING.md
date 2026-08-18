@@ -69,7 +69,7 @@ Dies verhindert, dass online nach Updates gesucht wird.
 ### Lösung 5: Alternative Pipeline verwenden
 
 Statt `pyannote/speaker-diarization-community-1` kannst du auch
-`pyannote/speaker-diarization-3.1` verwenden (neuere Version):
+das ältere `pyannote/speaker-diarization-3.1` verwenden (Fallback).
 
 In `transcribe_with_speakers.py`, Zeile 187:
 

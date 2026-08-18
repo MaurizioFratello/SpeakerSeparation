@@ -1,9 +1,9 @@
 # ML stack (install after CUDA PyTorch wheels in Docker).
 # Local dev may use scripts/requirements_transcription.txt instead.
 
-# Cap major version: 4.x pulls stacks that may upgrade PyTorch away from the CUDA base image.
-pyannote.audio>=3.1.0,<4.0
+# community-1 requires pyannote.audio 4.x (needs torch>=2.8, matching the CUDA 12.8 image).
+pyannote.audio>=4.0,<5.0
 openai-whisper>=20231117
 nemo_toolkit[asr]
 soundfile>=0.12.1
-huggingface-hub>=0.20.0
+huggingface-hub>=0.28.1
