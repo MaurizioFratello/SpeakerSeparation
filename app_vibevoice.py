@@ -18,7 +18,7 @@ from vibevoice_poc import (
     format_transcript,
     merge_consecutive_segments,
     parse_model_output,
-    prepare_media_for_transcription,
+    prepare_dropped_media,
     setup_cache_env,
     speaker_samples_to_html,
     write_markdown_file,
@@ -104,33 +104,54 @@ def _build_transcript_header(result: Dict[str, Any], segments: List[Dict[str, An
     )
 
 
+def _file_path_and_name(file_input: Any) -> tuple[str | None, str | None]:
+    path = _normalize_audio_input(file_input)
+    if not path:
+        return None, None
+    orig = None
+    if isinstance(file_input, dict):
+        orig = file_input.get("orig_name") or file_input.get("origName")
+    orig = orig or getattr(file_input, "orig_name", None)
+    display_name = Path(orig).name if orig else Path(path).name
+    return path, display_name
+
+
+def on_media_drop(file_input: Any) -> Generator[tuple[str, Any, Dict[str, Any]], None, None]:
+    empty: Dict[str, Any] = {"wav_path": None, "source_stem": None, "source_name": None}
+    path, display_name = _file_path_and_name(file_input)
+    if not path:
+        yield "Drop an audio or video file.", None, empty
+        return
+
+    shown = display_name or Path(path).name
+    yield f"Converting `{shown}` to 24 kHz mono WAV...", None, empty
+    try:
+        prepared = prepare_dropped_media(path)
+    except Exception as exc:
+        logger.exception("Media conversion failed")
+        yield f"Conversion failed: {exc}", None, empty
+        return
+
+    prepared["source_name"] = shown
+    prepared["source_stem"] = Path(shown).stem
+    prepared["status"] = f"Ready: `{shown}` → `{Path(prepared['wav_path']).name}`"
+    yield prepared["status"], prepared["wav_path"], prepared
+
+
 def transcribe_file(
-    audio_input: Any,
-    video_input: Any,
+    media_state: Dict[str, Any],
     hotwords: str,
     max_new_tokens: int,
     progress: gr.Progress = gr.Progress(),
 ) -> Generator[tuple[Any, ...], None, None]:
     empty_state: Dict[str, Any] = {}
-    audio_path = _normalize_audio_input(audio_input)
-    video_path = _normalize_audio_input(video_input)
-
-    try:
-        resolved_path, display_stem = prepare_media_for_transcription(audio_path, video_path)
-    except Exception as exc:
-        logger.exception("Failed to prepare media for transcription")
-        yield (
-            f"Could not prepare media: {exc}",
-            traceback.format_exc(),
-            empty_state,
-            None,
-            *_empty_speaker_updates(),
-        )
-        return
+    media_state = media_state or {}
+    resolved_path = media_state.get("wav_path")
+    display_stem = media_state.get("source_stem")
 
     if not resolved_path:
         yield (
-            "Please upload an audio or video file.",
+            "Please drop an audio or video file and wait for conversion to finish.",
             "",
             empty_state,
             None,
@@ -143,14 +164,9 @@ def transcribe_file(
         return
 
     display_name = display_stem or Path(resolved_path).stem
-    if video_path:
-        logger.info("Transcribe requested for video %s (audio: %s)", video_path, resolved_path)
-        status_line = f"Extracting audio from `{Path(video_path).name}` and transcribing..."
-    else:
-        logger.info("Transcribe requested for %s", resolved_path)
-        status_line = f"Transcribing `{display_name}`..."
+    logger.info("Transcribe requested for %s (converted: %s)", display_name, resolved_path)
     yield (
-        f"{status_line}\nThis can take several minutes for longer media. Please wait.",
+        f"Transcribing `{display_name}`...\nThis can take several minutes for longer media. Please wait.",
         "",
         empty_state,
         None,
@@ -265,26 +281,42 @@ def build_ui(model_id: str, device: str) -> gr.Blocks:
         gr.Markdown(
             "Local-only experiment using "
             "[microsoft/VibeVoice-ASR](https://huggingface.co/microsoft/VibeVoice-ASR). "
-            "Upload audio or video to get a speaker-labeled transcript with timestamps. "
-            "Video files are converted to audio first (no visual speaker detection)."
+            "Drop an audio or video file; it is converted to 24 kHz mono WAV before transcription. "
+            "Video files contribute audio only (no visual speaker detection)."
         )
         gr.Markdown(f"**Status:** {status}")
 
         transcript_state = gr.State({})
+        media_state = gr.State({})
 
-        with gr.Tabs():
-            with gr.Tab("Audio"):
-                audio_input = gr.Audio(
-                    label="Audio file",
-                    sources=["upload"],
-                    type="filepath",
-                )
-            with gr.Tab("Video"):
-                video_input = gr.File(
-                    label="Video file (mp4, mkv, webm, mov, …)",
-                    file_types=["video"],
-                    type="filepath",
-                )
+        media_input = gr.File(
+            label="Drop audio or video",
+            file_types=[
+                "audio",
+                "video",
+                ".wav",
+                ".mp3",
+                ".m4a",
+                ".flac",
+                ".ogg",
+                ".aac",
+                ".wma",
+                ".opus",
+                ".mp4",
+                ".mkv",
+                ".webm",
+                ".mov",
+                ".avi",
+                ".m4v",
+            ],
+            type="filepath",
+        )
+        conversion_status = gr.Markdown("Drop an audio or video file to convert it to 24 kHz mono WAV.")
+        audio_preview = gr.Audio(
+            label="Converted audio preview",
+            type="filepath",
+            interactive=False,
+        )
 
         hotwords = gr.Textbox(
             label="Hotwords / context (optional)",
@@ -332,9 +364,16 @@ def build_ui(model_id: str, device: str) -> gr.Blocks:
             max_lines=30,
         )
 
+        media_input.change(
+            fn=on_media_drop,
+            inputs=[media_input],
+            outputs=[conversion_status, audio_preview, media_state],
+            show_progress="full",
+        )
+
         run_btn.click(
             fn=transcribe_file,
-            inputs=[audio_input, video_input, hotwords, max_tokens],
+            inputs=[media_state, hotwords, max_tokens],
             outputs=[
                 transcript_out,
                 raw_out,

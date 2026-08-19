@@ -18,6 +18,9 @@ DEFAULT_MODEL_ID = "microsoft/VibeVoice-ASR"
 VIDEO_EXTENSIONS = frozenset(
     {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".wmv", ".flv", ".mpeg", ".mpg"}
 )
+TARGET_SAMPLE_RATE = 24000
+TARGET_CHANNELS = 1
+TARGET_AUDIO_CODEC = "pcm_s16le"
 
 
 def setup_cache_env() -> Path:
@@ -144,36 +147,48 @@ def is_video_path(path: str) -> bool:
     return Path(path).suffix.lower() in VIDEO_EXTENSIONS
 
 
-def extract_audio_from_video(video_path: str) -> str:
-    """Extract mono WAV audio from a video file for transcription."""
+def convert_media_to_wav(media_path: str) -> str:
+    """Convert any audio or video file to 24 kHz mono 16-bit PCM WAV."""
     import subprocess
 
-    source = Path(video_path)
+    source = Path(media_path)
     if not source.is_file():
-        raise FileNotFoundError(f"Video not found: {video_path}")
+        raise FileNotFoundError(f"Media not found: {media_path}")
 
-    out_dir = Path(tempfile.mkdtemp(prefix="vibevoice_video_"))
+    out_dir = Path(tempfile.mkdtemp(prefix="vibevoice_media_"))
     wav_path = out_dir / f"{source.stem}.wav"
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(source),
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            "24000",
-            str(wav_path),
-        ],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(source),
+                "-vn",
+                "-ac",
+                str(TARGET_CHANNELS),
+                "-ar",
+                str(TARGET_SAMPLE_RATE),
+                "-c:a",
+                TARGET_AUDIO_CODEC,
+                str(wav_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or str(exc)).strip().splitlines()
+        tail = "\n".join(detail[-8:]) if detail else str(exc)
+        raise RuntimeError(f"Failed to convert {source.name} to WAV:\n{tail}") from exc
     if not wav_path.is_file() or wav_path.stat().st_size == 0:
-        raise RuntimeError(f"Failed to extract audio from {video_path}")
+        raise RuntimeError(f"Failed to convert {media_path} to WAV")
     return str(wav_path)
+
+
+def extract_audio_from_video(video_path: str) -> str:
+    """Extract mono WAV audio from a video file for transcription."""
+    return convert_media_to_wav(video_path)
 
 
 def prepare_media_for_transcription(
@@ -184,15 +199,31 @@ def prepare_media_for_transcription(
     Resolve upload to an audio file path suitable for VibeVoice.
 
     Returns (audio_path, display_stem). display_stem prefers the original media name.
+    Any audio or video source is converted to 24 kHz mono WAV.
     """
-    if video_path:
-        stem = Path(video_path).stem
-        if is_video_path(video_path):
-            return extract_audio_from_video(video_path), stem
-        return video_path, stem
-    if audio_path:
-        return audio_path, Path(audio_path).stem
-    return None, None
+    source = video_path or audio_path
+    if not source:
+        return None, None
+    return convert_media_to_wav(source), Path(source).stem
+
+
+def prepare_dropped_media(media_path: Optional[str]) -> Dict[str, Optional[str]]:
+    """Convert a dropped audio/video file to the target WAV format."""
+    if not media_path:
+        return {
+            "wav_path": None,
+            "source_stem": None,
+            "source_name": None,
+            "status": "Drop an audio or video file.",
+        }
+    source = Path(media_path)
+    wav_path = convert_media_to_wav(str(source))
+    return {
+        "wav_path": wav_path,
+        "source_stem": source.stem,
+        "source_name": source.name,
+        "status": f"Ready: `{source.name}` → `{Path(wav_path).name}`",
+    }
 
 
 def _load_audio_array(audio_path: str):
